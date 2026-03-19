@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>热成像摄像头</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; }
+body { background:#000; overflow:hidden; width:100vw; height:100dvh; display:flex; flex-direction:column; font-family:'Courier New',monospace; }
+
+#main { flex:1; position:relative; overflow:hidden; touch-action:none; }
+
+video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+
+#base-canvas { position:absolute; inset:0; width:100%; height:100%; }
+#thermal-canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+#ui-canvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+
+#hud {
+  position:absolute; top:0; left:0; right:0;
+  display:flex; justify-content:space-between; align-items:center;
+  padding:10px 16px;
+  background:linear-gradient(to bottom, rgba(0,0,0,0.7), transparent);
+  pointer-events:none; z-index:10;
+}
+
+.pill {
+  background:rgba(0,0,0,0.55);
+  border:1px solid rgba(255,255,255,0.2);
+  border-radius:999px;
+  padding:6px 14px;
+  font-size:12px;
+  color:#fff;
+  display:flex; align-items:center; gap:6px;
+  backdrop-filter:blur(4px);
+}
+
+#bottom-bar {
+  background:rgba(0,0,0,0.85);
+  padding:10px 16px;
+  display:flex; justify-content:space-around; align-items:center;
+  gap:8px; flex-shrink:0; z-index:10;
+  border-top:1px solid rgba(255,255,255,0.08);
+}
+
+.mode-btn {
+  background:rgba(255,255,255,0.07);
+  border:1px solid rgba(255,255,255,0.15);
+  color:rgba(255,255,255,0.6);
+  font-size:11px; letter-spacing:1px;
+  padding:7px 14px; border-radius:999px;
+  cursor:pointer; transition:all 0.2s;
+  font-family:'Courier New',monospace;
+}
+.mode-btn.active {
+  background:rgba(255,255,255,0.18);
+  border-color:rgba(255,255,255,0.5);
+  color:#fff;
+}
+.mode-btn:active { transform:scale(0.95); }
+
+#start-screen {
+  position:absolute; inset:0; z-index:50;
+  background:#000;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:24px;
+}
+#start-screen h1 { color:#fff; font-size:22px; font-weight:300; letter-spacing:4px; }
+#start-screen p { color:rgba(255,255,255,0.4); font-size:13px; text-align:center; line-height:1.8; }
+
+#open-btn {
+  background:transparent; border:1px solid rgba(255,255,255,0.4);
+  color:#fff; font-size:13px; letter-spacing:3px;
+  padding:14px 36px; border-radius:999px; cursor:pointer;
+  font-family:'Courier New',monospace; transition:all 0.3s;
+}
+#open-btn:active { background:rgba(255,255,255,0.1); transform:scale(0.97); }
+
+.corner-dot {
+  position:absolute; width:48px; height:48px;
+  transform:translate(-50%,-50%);
+  z-index:20; cursor:grab; touch-action:none;
+  display:flex; align-items:center; justify-content:center;
+}
+.corner-dot:active { cursor:grabbing; }
+.corner-dot::after {
+  content:''; width:16px; height:16px;
+  border-radius:50%; background:#fff;
+  box-shadow:0 0 0 3px rgba(255,255,255,0.25), 0 0 16px rgba(255,255,255,0.4);
+}
+</style>
+</head>
+<body>
+
+<div id="main">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="base-canvas"></canvas>
+  <canvas id="thermal-canvas"></canvas>
+  <canvas id="ui-canvas"></canvas>
+
+  <div id="hud">
+    <div class="pill">拖角调整 · 双指缩放</div>
+    <div class="pill" id="mode-pill">铁红</div>
+  </div>
+
+  <div class="corner-dot" id="c-tl"></div>
+  <div class="corner-dot" id="c-tr"></div>
+  <div class="corner-dot" id="c-bl"></div>
+  <div class="corner-dot" id="c-br"></div>
+</div>
+
+<div id="bottom-bar">
+  <button class="mode-btn" data-mode="rainbow">彩虹</button>
+  <button class="mode-btn active" data-mode="iron">铁红</button>
+  <button class="mode-btn" data-mode="cold">冷蓝</button>
+  <button class="mode-btn" data-mode="lava">熔岩</button>
+  <button class="mode-btn" data-mode="grey">灰度</button>
+</div>
+
+<div id="start-screen">
+  <h1>热成像</h1>
+  <p>将摄像头对准场景<br>拖动四角调整视图范围<br>双指捏合缩放</p>
+  <button id="open-btn">开启摄像头</button>
+</div>
+
+<script>
+const video = document.getElementById('video');
+const baseCanvas = document.getElementById('base-canvas');
+const thermalCanvas = document.getElementById('thermal-canvas');
+const uiCanvas = document.getElementById('ui-canvas');
+const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
+const thermalCtx = thermalCanvas.getContext('2d');
+const uiCtx = uiCanvas.getContext('2d');
+const modePill = document.getElementById('mode-pill');
+const startScreen = document.getElementById('start-screen');
+
+let W = 0, H = 0, running = false, currentMode = 'iron';
+
+const offCanvas = document.createElement('canvas');
+const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+const blurCanvas = document.createElement('canvas');
+const blurCtx = blurCanvas.getContext('2d');
+
+const box = { x: 0.08, y: 0.12, w: 0.84, h: 0.72 };
+
+function resize() {
+  const main = document.getElementById('main');
+  W = main.offsetWidth; H = main.offsetHeight;
+  [baseCanvas, thermalCanvas, uiCanvas].forEach(c => { c.width = W; c.height = H; });
+  const scale = 5;
+  offCanvas.width = Math.floor(W / scale);
+  offCanvas.height = Math.floor(H / scale);
+  blurCanvas.width = Math.floor(W / scale);
+  blurCanvas.height = Math.floor(H / scale);
+  updateDots();
+}
+resize();
+window.addEventListener('resize', resize);
+
+function updateDots() {
+  const set = (id, nx, ny) => {
+    const el = document.getElementById(id);
+    el.style.left = (nx * W) + 'px';
+    el.style.top = (ny * H) + 'px';
+  };
+  set('c-tl', box.x, box.y);
+  set('c-tr', box.x + box.w, box.y);
+  set('c-bl', box.x, box.y + box.h);
+  set('c-br', box.x + box.w, box.y + box.h);
+}
+
+function interpolateStops(stops, v) {
+  v = Math.max(0, Math.min(1, v));
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i], [t1, c1] = stops[i+1];
+    if (v >= t0 && v <= t1) {
+      const t = (v - t0) / (t1 - t0);
+      return [
+        Math.round(c0[0] + (c1[0]-c0[0]) * t),
+        Math.round(c0[1] + (c1[1]-c0[1]) * t),
+        Math.round(c0[2] + (c1[2]-c0[2]) * t)
+      ];
+    }
+  }
+  return stops[stops.length-1][1];
+}
+
+const PALETTES = {
+  rainbow: v => interpolateStops([
+    [0,   [0,0,180]],   [0.2, [0,80,220]],
+    [0.35,[0,200,100]], [0.5, [60,220,0]],
+    [0.65,[220,220,0]], [0.8, [255,100,0]],
+    [1.0, [220,0,0]]
+  ], v),
+  iron: v => interpolateStops([
+    [0,   [0,0,50]],    [0.25,[80,0,130]],
+    [0.5, [210,20,60]], [0.75,[255,130,0]],
+    [1.0, [255,255,180]]
+  ], v),
+  cold: v => interpolateStops([
+    [0,   [5,5,80]],   [0.35,[0,40,200]],
+    [0.65,[0,150,220]],[0.85,[80,210,240]],
+    [1.0, [210,240,255]]
+  ], v),
+  lava: v => interpolateStops([
+    [0,   [5,0,0]],    [0.3, [110,0,0]],
+    [0.55,[210,40,0]], [0.75,[255,130,0]],
+    [0.9, [255,210,50]],[1.0, [255,255,210]]
+  ], v),
+  grey: v => { const g = Math.round(v*255); return [g,g,g]; }
+};
+
+function processFrame() {
+  if (!running) return;
+  const OW = offCanvas.width, OH = offCanvas.height;
+  const bx = box.x*W, by = box.y*H, bw = box.w*W, bh = box.h*H;
+
+  // Draw full mirrored video to base
+  baseCtx.save(); baseCtx.scale(-1,1); baseCtx.drawImage(video,-W,0,W,H); baseCtx.restore();
+
+  // Darken everything outside box
+  baseCtx.fillStyle = 'rgba(0,0,0,0.6)';
+  baseCtx.fillRect(0,0,W,H);
+  baseCtx.save();
+  baseCtx.globalCompositeOperation = 'destination-out';
+  baseCtx.fillStyle = 'rgba(0,0,0,1)';
+  baseCtx.fillRect(bx, by, bw, bh);
+  baseCtx.restore();
+
+  // Sample low-res for fluid look
+  offCtx.save(); offCtx.scale(-1,1); offCtx.drawImage(video,-OW,0,OW,OH); offCtx.restore();
+
+  const ox = Math.floor(box.x * OW), oy = Math.floor(box.y * OH);
+  const ow = Math.max(1, Math.floor(box.w * OW)), oh = Math.max(1, Math.floor(box.h * OH));
+  const src = offCtx.getImageData(ox, oy, ow, oh);
+  const out = new ImageData(ow, oh);
+
+  for (let i = 0; i < ow * oh; i++) {
+    const r = src.data[i*4], g = src.data[i*4+1], b = src.data[i*4+2];
+    const v = (r*0.299 + g*0.587 + b*0.114) / 255;
+    const [tr, tg, tb] = PALETTES[currentMode](v);
+    out.data[i*4] = tr; out.data[i*4+1] = tg; out.data[i*4+2] = tb; out.data[i*4+3] = 255;
+  }
+
+  blurCtx.putImageData(out, 0, 0);
+
+  // Scale up with bilinear smoothing = fluid effect
+  thermalCtx.clearRect(0,0,W,H);
+  thermalCtx.imageSmoothingEnabled = true;
+  thermalCtx.imageSmoothingQuality = 'high';
+  thermalCtx.drawImage(blurCanvas, ox, oy, ow, oh, bx, by, bw, bh);
+
+  drawUI();
+  requestAnimationFrame(processFrame);
+}
+
+function drawUI() {
+  uiCtx.clearRect(0,0,W,H);
+  const bx = box.x*W, by = box.y*H, bw = box.w*W, bh = box.h*H;
+  const cs = 20;
+  uiCtx.strokeStyle = 'rgba(255,255,255,0.85)';
+  uiCtx.lineWidth = 2.5; uiCtx.lineCap = 'round';
+  // Corners only
+  [[bx,by,1,1],[bx+bw,by,-1,1],[bx,by+bh,1,-1],[bx+bw,by+bh,-1,-1]].forEach(([x,y,sx,sy]) => {
+    uiCtx.beginPath();
+    uiCtx.moveTo(x+sx*cs, y); uiCtx.lineTo(x, y); uiCtx.lineTo(x, y+sy*cs);
+    uiCtx.stroke();
+  });
+  // Thin border
+  uiCtx.strokeStyle = 'rgba(255,255,255,0.3)';
+  uiCtx.lineWidth = 1;
+  uiCtx.strokeRect(bx, by, bw, bh);
+}
+
+// Corner drag
+let dragging = null;
+['c-tl','c-tr','c-bl','c-br'].forEach(id => {
+  const el = document.getElementById(id);
+  const onStart = e => { e.preventDefault(); dragging = id.replace('c-',''); };
+  el.addEventListener('mousedown', onStart);
+  el.addEventListener('touchstart', onStart, { passive:false });
+});
+
+function getPos(e) {
+  const src = e.touches ? e.touches[0] : e;
+  return { x: src.clientX, y: src.clientY };
+}
+
+function onMove(e) {
+  if (!dragging) return;
+  e.preventDefault();
+  const rect = document.getElementById('main').getBoundingClientRect();
+  const { x: cx, y: cy } = getPos(e);
+  const nx = (cx - rect.left) / W, ny = (cy - rect.top) / H;
+  const m = 0.03;
+  if (dragging === 'tl') { box.w += box.x-nx; box.h += box.y-ny; box.x=nx; box.y=ny; }
+  else if (dragging === 'tr') { box.w = nx-box.x; box.h += box.y-ny; box.y=ny; }
+  else if (dragging === 'bl') { box.w += box.x-nx; box.x=nx; box.h=ny-box.y; }
+  else if (dragging === 'br') { box.w=nx-box.x; box.h=ny-box.y; }
+  box.x=Math.max(m,box.x); box.y=Math.max(m,box.y);
+  box.w=Math.max(0.12,Math.min(1-box.x-m,box.w));
+  box.h=Math.max(0.12,Math.min(1-box.y-m,box.h));
+  updateDots();
+}
+function onEnd() { dragging = null; }
+window.addEventListener('mousemove', onMove);
+window.addEventListener('mouseup', onEnd);
+window.addEventListener('touchmove', onMove, { passive:false });
+window.addEventListener('touchend', onEnd);
+
+// Pinch zoom
+let pinchDist = null, pinchCenter = null;
+document.getElementById('main').addEventListener('touchmove', e => {
+  if (e.touches.length !== 2 || dragging) { pinchDist=null; pinchCenter=null; return; }
+  e.preventDefault();
+  const t0=e.touches[0], t1=e.touches[1];
+  const dist = Math.hypot(t1.clientX-t0.clientX, t1.clientY-t0.clientY);
+  const mc = { x:(t0.clientX+t1.clientX)/2, y:(t0.clientY+t1.clientY)/2 };
+  const rect = document.getElementById('main').getBoundingClientRect();
+  if (pinchDist !== null) {
+    const scale = dist/pinchDist;
+    const dw = box.w*(scale-1), dh = box.h*(scale-1);
+    box.x -= dw/2; box.y -= dh/2; box.w += dw; box.h += dh;
+    if (pinchCenter) {
+      box.x += (mc.x-pinchCenter.x)/W;
+      box.y += (mc.y-pinchCenter.y)/H;
+    }
+    const m=0.02;
+    box.x=Math.max(m,Math.min(1-box.w-m,box.x));
+    box.y=Math.max(m,Math.min(1-box.h-m,box.y));
+    box.w=Math.max(0.12,Math.min(1-box.x-m,box.w));
+    box.h=Math.max(0.12,Math.min(1-box.y-m,box.h));
+    updateDots();
+  }
+  pinchDist=dist; pinchCenter=mc;
+}, { passive:false });
+document.getElementById('main').addEventListener('touchend', ()=>{ pinchDist=null; pinchCenter=null; });
+
+// Mode switch
+document.querySelectorAll('.mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    currentMode = btn.dataset.mode;
+    modePill.textContent = btn.textContent;
+  });
+});
+
+// Start
+document.getElementById('open-btn').addEventListener('click', async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode:{ ideal:'environment' }, width:{ ideal:1280 }, height:{ ideal:720 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    startScreen.style.display = 'none';
+    running = true;
+    requestAnimationFrame(processFrame);
+  } catch(err) {
+    alert('无法访问摄像头，请检查权限后重试');
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>
